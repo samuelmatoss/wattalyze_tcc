@@ -5,74 +5,215 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Alert;
 use App\Models\AlertRule;
+use App\Models\Device;
+use App\Models\Environment;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Validator;
+use Illuminate\Http\JsonResponse;
 
 class AlertController extends Controller
 {
-    public function index(Request $request)
+    /**
+     * Get all alert rules for authenticated user
+     */
+    public function rules(): JsonResponse
     {
-        $alerts = Alert::with('device', 'environment')
-            ->where('user_id', auth()->id())
-            ->when($request->status, function ($query, $status) {
-                if ($status === 'active') {
-                    return $query->where('is_resolved', false);
-                } elseif ($status === 'resolved') {
-                    return $query->where('is_resolved', true);
-                }
-            })
-            ->orderBy('created_at', 'desc')
+        $rules = AlertRule::where('user_id', auth()->id())
+            ->with(['device', 'environment'])
             ->get();
-            
-        return response()->json($alerts);
+
+        return response()->json([
+            'rules' => $rules,
+            'devices' => Device::where('user_id', auth()->id())->get(),
+            'environments' => Environment::where('user_id', auth()->id())->get()
+        ]);
     }
 
-    public function storeRule(Request $request)
+    /**
+     * Create new alert rule
+     */
+    public function storeRule(Request $request): JsonResponse
     {
-        $validator = Validator::make($request->all(), [
+        $validated = $request->validate([
             'name' => 'required|string|max:255',
             'type' => 'required|in:consumption_threshold,cost_threshold,offline_duration,anomaly_detection',
-            'threshold_value' => 'required|numeric',
-            // ... outros campos
+            'threshold_value' => 'nullable|numeric',
+            'device_id' => 'nullable|exists:devices,id',
+            'environment_id' => 'nullable|exists:environments,id',
+            'condition' => 'nullable|string',
+            'notification_channels' => 'nullable|array',
+            'notification_channels.*' => 'in:email',
         ]);
 
-        if ($validator->fails()) {
-            return response()->json($validator->errors(), 422);
-        }
-
-        $rule = AlertRule::create(array_merge(
-            $validator->validated(),
-            ['user_id' => auth()->id()]
-        ));
-        
-        return response()->json($rule, 201);
-    }
-
-    public function updateRule(Request $request, $id)
-    {
-        $rule = AlertRule::where('user_id', auth()->id())
-            ->findOrFail($id);
-            
-        $validator = Validator::make($request->all(), [
-            'name' => 'sometimes|required|string|max:255',
-            'is_active' => 'sometimes|boolean',
-            // ... outros campos
+        $rule = AlertRule::create([
+            'user_id' => auth()->id(),
+            'device_id' => $request->device_id,
+            'environment_id' => $request->environment_id,
+            'name' => $validated['name'],
+            'type' => $validated['type'],
+            'threshold_value' => $validated['threshold_value'] ?? null,
+            'condition' => $request->filled('condition') ? json_encode(['expression' => $request->condition]) : null,
+            'notification_channels' => $request->filled('notification_channels') ? json_encode($request->notification_channels) : null,
         ]);
 
-        if ($validator->fails()) {
-            return response()->json($validator->errors(), 422);
-        }
-
-        $rule->update($validator->validated());
-        return response()->json($rule);
+        return response()->json([
+            'message' => 'Regra de alerta criada com sucesso!',
+            'rule' => $rule
+        ], 201);
     }
 
-    public function destroyRule($id)
+    /**
+     * Get active alerts
+     */
+    public function active(): JsonResponse
     {
-        $rule = AlertRule::where('user_id', auth()->id())
-            ->findOrFail($id);
-            
+        $alerts = Alert::where('user_id', auth()->id())
+            ->where('is_resolved', false)
+            ->with(['device', 'environment'])
+            ->latest()
+            ->paginate(10);
+
+        return response()->json(['alerts' => $alerts]);
+    }
+
+    /**
+     * Get alert history
+     */
+    public function history(): JsonResponse
+    {
+        $alerts = Alert::where('user_id', auth()->id())
+            ->with(['device', 'environment'])
+            ->latest()
+            ->paginate(20);
+
+        return response()->json(['alerts' => $alerts]);
+    }
+
+    /**
+     * Mark alert as resolved
+     */
+    public function markResolved(Alert $alert): JsonResponse
+    {
+        if ($alert->user_id !== auth()->id()) {
+            return response()->json(['error' => 'Unauthorized'], 403);
+        }
+
+        $alert->update([
+            'is_resolved' => true,
+            'resolved_at' => now()
+        ]);
+
+        return response()->json(['message' => 'Alerta marcado como resolvido!']);
+    }
+
+    /**
+     * Get single rule for editing
+     */
+    public function editRule(AlertRule $rule): JsonResponse
+    {
+        if ($rule->user_id !== auth()->id()) {
+            return response()->json(['error' => 'Unauthorized'], 403);
+        }
+
+        return response()->json([
+            'rule' => $rule->load(['device', 'environment']),
+            'devices' => Device::where('user_id', auth()->id())->get(),
+            'environments' => Environment::where('user_id', auth()->id())->get()
+        ]);
+    }
+
+    /**
+     * Update alert rule
+     */
+    public function updateRule(Request $request, AlertRule $rule): JsonResponse
+    {
+        if ($rule->user_id !== auth()->id()) {
+            return response()->json(['error' => 'Unauthorized'], 403);
+        }
+
+        $validated = $request->validate([
+            'name' => 'required|string|max:255',
+            'type' => 'required|in:consumption_threshold,cost_threshold,offline_duration,anomaly_detection',
+            'threshold_value' => 'nullable|numeric',
+            'device_id' => 'nullable|exists:devices,id',
+            'environment_id' => 'nullable|exists:environments,id',
+            'condition' => 'nullable|string',
+            'notification_channels' => 'nullable|array',
+            'notification_channels.*' => 'in:email',
+        ]);
+
+        $rule->update([
+            'device_id' => $validated['device_id'] ?? null,
+            'environment_id' => $validated['environment_id'] ?? null,
+            'name' => $validated['name'],
+            'type' => $validated['type'],
+            'threshold_value' => $validated['threshold_value'] ?? null,
+            'condition' => $request->filled('condition') ? json_encode(['expression' => $request->condition]) : null,
+            'notification_channels' => $request->filled('notification_channels') ? json_encode($request->notification_channels) : null,
+        ]);
+
+        return response()->json(['message' => 'Regra de alerta atualizada com sucesso!']);
+    }
+
+    /**
+     * Delete alert rule
+     */
+    public function destroyRule(AlertRule $rule): JsonResponse
+    {
+        if ($rule->user_id !== auth()->id()) {
+            return response()->json(['error' => 'Unauthorized'], 403);
+        }
+
         $rule->delete();
-        return response()->json(null, 204);
+
+        return response()->json(['message' => 'Regra de alerta excluída com sucesso!']);
+    }
+
+    /**
+     * Toggle rule status
+     */
+    public function toggleRule(AlertRule $rule): JsonResponse
+    {
+        if ($rule->user_id !== auth()->id()) {
+            return response()->json(['error' => 'Unauthorized'], 403);
+        }
+
+        $rule->is_active = !$rule->is_active;
+        $rule->save();
+
+        return response()->json([
+            'message' => 'Status da regra alterado com sucesso!',
+            'is_active' => $rule->is_active
+        ]);
+    }
+
+    /**
+     * Acknowledge alert
+     */
+    public function acknowledge(Alert $alert): JsonResponse
+    {
+        if ($alert->user_id !== auth()->id()) {
+            return response()->json(['error' => 'Unauthorized'], 403);
+        }
+
+        $alert->update(['is_read' => true]);
+
+        return response()->json(['message' => 'Alerta marcado como lido!']);
+    }
+
+    /**
+     * Bulk resolve alerts
+     */
+    public function bulkResolve(Request $request): JsonResponse
+    {
+        $ids = $request->input('alert_ids', []);
+
+        Alert::whereIn('id', $ids)
+            ->where('user_id', auth()->id())
+            ->update([
+                'is_resolved' => true,
+                'resolved_at' => now()
+            ]);
+
+        return response()->json(['message' => 'Alertas selecionados foram resolvidos!']);
     }
 }

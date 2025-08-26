@@ -322,22 +322,6 @@ FLUX;
             ->with('success', 'Dispositivo cadastrado com sucesso!');
     }
 
-    public function show(Device $device)
-    {
-        $this->authorize('view', $device);
-
-        // Cache para dados de consumo do dispositivo
-        $cacheKey = "device_consumption_{$device->id}";
-        $consumption = Cache::remember($cacheKey, 300, function () use ($device) {
-            return $device->energyConsumptions()
-                ->select(['timestamp', 'consumption_kwh', 'instantaneous_power'])
-                ->orderBy('timestamp', 'desc')
-                ->limit(100)
-                ->get();
-        });
-
-        return view('devices.show', compact('device', 'consumption'));
-    }
 
     public function edit(Device $device)
     {
