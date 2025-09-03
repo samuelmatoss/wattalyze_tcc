@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Http\Controllers\Api;
+namespace App\Http\Controllers\Web;
 
 use App\Http\Controllers\Controller;
 use App\Models\Report;
@@ -9,43 +9,29 @@ use App\Models\Environment;
 use Illuminate\Http\Request;
 use App\Jobs\GenerateReportJob;
 use Illuminate\Support\Facades\Storage;
-use Illuminate\Http\JsonResponse;
-use Illuminate\Support\Facades\Validator;
 
 class ReportController extends Controller
 {
-    /**
-     * Get all reports for authenticated user
-     */
-    public function index(): JsonResponse
+    public function index()
     {
         $reports = Report::where('user_id', auth()->id())
             ->latest()
             ->paginate(10);
 
-        return response()->json(['reports' => $reports]);
+        return view('reports.index', compact('reports'));
     }
 
-    /**
-     * Get form data for generating a new report
-     */
-    public function generateForm(): JsonResponse
+    public function generateForm()
     {
         $devices = Device::where('user_id', auth()->id())->get();
         $environments = Environment::where('user_id', auth()->id())->get();
 
-        return response()->json([
-            'devices' => $devices,
-            'environments' => $environments
-        ]);
+        return view('reports.generate', compact('devices', 'environments'));
     }
 
-    /**
-     * Generate a new report
-     */
-    public function generate(Request $request): JsonResponse
+    public function generate(Request $request)
     {
-        $validator = Validator::make($request->all(), [
+        $validated = $request->validate([
             'name' => 'required|string|max:255',
             'type' => 'required|in:consumption,cost,efficiency,comparative,custom',
             'period_type' => 'required|in:daily,weekly,monthly,yearly,custom',
@@ -55,15 +41,6 @@ class ReportController extends Controller
             'devices' => 'nullable|array',
             'environments' => 'nullable|array',
         ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'message' => 'Validation failed',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
-        $validated = $validator->validated();
 
         $report = Report::create([
             'user_id' => auth()->id(),
@@ -75,74 +52,34 @@ class ReportController extends Controller
             ...$validated,
         ]);
 
-        // Dispatch the report generation job (async)
-        GenerateReportJob::dispatch($report);
+        // Executa o job **sincronamente** (sem fila)
+        $job = new GenerateReportJob($report);
+        $job->handle();
 
-        return response()->json([
-            'message' => 'Relatório está sendo gerado!',
-            'report_id' => $report->id
-        ], 202);
+        return redirect()->route('reports.index')
+            ->with('success', 'Relatório gerado com sucesso!');
     }
-
-    /**
-     * Delete a report
-     */
-    public function destroy(Report $report): JsonResponse
+   public function destroy(Report $report)
     {
-        // Check authorization
-        if ($report->user_id !== auth()->id()) {
-            return response()->json(['error' => 'Unauthorized'], 403);
-        }
 
-        // Delete the file from storage if it exists
+        // Apagar o arquivo do storage se existir
         if ($report->file_path && Storage::exists($report->file_path)) {
             Storage::delete($report->file_path);
         }
 
         $report->delete();
 
-        return response()->json(['message' => 'Relatório excluído com sucesso!']);
+        return redirect()->route('reports.index')
+            ->with('success', 'Relatório excluído com sucesso!');
     }
-
-    /**
-     * Download a report
-     */
-    public function download(Report $report): JsonResponse
+    public function download(Report $report)
     {
-        // Check authorization
-        if ($report->user_id !== auth()->id()) {
-            return response()->json(['error' => 'Unauthorized'], 403);
-        }
+        $this->authorize('view', $report);
 
         if (!$report->file_path || $report->status !== 'completed') {
-            return response()->json(['error' => 'Relatório não disponível para download'], 404);
+            return back()->with('error', 'Relatório não disponível para download');
         }
 
-        // For API, return a URL to download the file
-        $url = Storage::url($report->file_path);
-        
-        return response()->json([
-            'download_url' => $url,
-            'expires_at' => now()->addHours(1)->toISOString() // URL expiration time
-        ]);
-    }
-
-    /**
-     * Get report status
-     */
-    public function status(Report $report): JsonResponse
-    {
-        // Check authorization
-        if ($report->user_id !== auth()->id()) {
-            return response()->json(['error' => 'Unauthorized'], 403);
-        }
-
-        return response()->json([
-            'status' => $report->status,
-            'progress' => $report->progress ?? 0,
-            'file_path' => $report->file_path,
-            'created_at' => $report->created_at,
-            'updated_at' => $report->updated_at
-        ]);
+        return response()->download(storage_path('app/' . $report->file_path));
     }
 }

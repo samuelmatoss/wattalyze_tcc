@@ -15,8 +15,11 @@ use Illuminate\Support\Facades\Log;
 
 class DeviceController extends Controller
 {
-    private const CACHE_TTL = 300; // 5 minutos
-    private const POWER_CACHE_TTL = 60; // 1 minuto para dados de potência
+    private const CACHE_TTL_DEVICES = 300; // 5 minutos
+    private const CACHE_TTL_ALERTS = 60; // 1 minuto
+    private const CACHE_TTL_DAILY_DATA = 600; // 10 minutos
+    private const CACHE_TTL_POWER_DATA = 60; // 1 minuto para dados de potência
+    private const CACHE_TTL_FORM_DATA = 1800; // 30 minutos
 
     public function index(InfluxDBService $influxService)
     {
@@ -25,10 +28,11 @@ class DeviceController extends Controller
         }
 
         $userId = auth()->id();
-        $cacheKey = "user_devices_data_{$userId}";
+        $sessionId = session()->getId();
+        $cacheKeyBase = "user_devices_data_{$userId}_{$sessionId}";
 
-        // Cache completo dos dados básicos por 5 minutos
-        $cachedData = Cache::remember($cacheKey, self::CACHE_TTL, function () use ($userId) {
+        // Cache dos dados básicos
+        $cachedData = Cache::remember("{$cacheKeyBase}_basic", self::CACHE_TTL_DEVICES, function () use ($userId) {
             return [
                 'devices' => Device::where('user_id', $userId)
                     ->with(['deviceType:id,name', 'environment:id,name'])
@@ -41,7 +45,7 @@ class DeviceController extends Controller
             ];
         });
 
-        // Dados em tempo real (cache menor)
+        // Dados em tempo real com cache individual por dispositivo
         $deviceIds = $cachedData['devices']->pluck('id')->toArray();
         $influxData = $this->getCachedInfluxData($influxService, $deviceIds);
         $dailyConsumption = $this->getCachedDailyConsumption($influxService, $deviceIds);
@@ -54,6 +58,7 @@ class DeviceController extends Controller
             'dailyConsumption' => $dailyConsumption
         ]);
     }
+
     private function getCachedInfluxData(InfluxDBService $influxService, array $deviceIds): array
     {
         $influxData = [];
@@ -61,7 +66,6 @@ class DeviceController extends Controller
         foreach ($deviceIds as $deviceId) {
             $device = Device::find($deviceId);
             if (!$device) {
-                // dispositivo removido — devolve valores neutros
                 $influxData[$deviceId] = [
                     'value' => null,
                     'unit' => null,
@@ -71,15 +75,22 @@ class DeviceController extends Controller
             }
 
             $measurementInfo = $this->getMeasurementInfo($device);
-            $cacheKey = "device_measurement_{$deviceId}";
+            $cacheKey = "device_measurement_{$deviceId}_" . Carbon::now()->format('Y-m-d-H-i');
 
-            $influxData[$deviceId] = Cache::remember($cacheKey, self::POWER_CACHE_TTL, function () use ($influxService, $device, $measurementInfo) {
-                $mac = $device->mac_address;
+            $influxData[$deviceId] = Cache::remember($cacheKey, self::CACHE_TTL_POWER_DATA, function () use ($influxService, $device, $measurementInfo) {
+                return $this->getRealTimeMeasurementData($influxService, $device, $measurementInfo);
+            });
+        }
 
-                // time range: energia precisa de janela curta; sensores podem ter janela maior
-                $timeRange = $measurementInfo['measurement'] === 'energy' ? '-30m' : '-24h';
+        return $influxData;
+    }
 
-                $lastQuery = <<<FLUX
+    private function getRealTimeMeasurementData(InfluxDBService $influxService, Device $device, array $measurementInfo): array
+    {
+        $mac = $device->mac_address;
+        $timeRange = $measurementInfo['measurement'] === 'energy' ? '-30m' : '-24h';
+
+        $lastQuery = <<<FLUX
 from(bucket: "{$influxService->getBucket()}")
 |> range(start: {$timeRange})
 |> filter(fn: (r) => r._measurement == "{$measurementInfo['measurement']}")
@@ -90,75 +101,66 @@ from(bucket: "{$influxService->getBucket()}")
 |> yield()
 FLUX;
 
-                try {
-                    $lastData = $influxService->queryEnergyData($lastQuery);
+        try {
+            $lastData = $influxService->queryEnergyData($lastQuery);
 
-                    Log::debug("LAST QUERY result for device {$device->id}", [
-                        'measurement' => $measurementInfo['measurement'],
-                        'field' => $measurementInfo['field'],
-                        'mac' => $mac,
-                        'timeRange' => $timeRange,
-                        'row_count' => count($lastData),
-                        'sample' => $lastData[0] ?? null
-                    ]);
+            Log::debug("LAST QUERY result for device {$device->id}", [
+                'measurement' => $measurementInfo['measurement'],
+                'field' => $measurementInfo['field'],
+                'mac' => $mac,
+                'timeRange' => $timeRange,
+                'row_count' => count($lastData),
+                'sample' => $lastData[0] ?? null
+            ]);
 
-                    $row = $lastData[0] ?? null;
-                    $rawValue = null;
-                    $rawTime = null;
+            $row = $lastData[0] ?? null;
+            $rawValue = null;
+            $rawTime = null;
 
-                    if (is_array($row)) {
-                        // prioriza _value (Flux), depois value (possíveis libs)
-                        if (array_key_exists('_value', $row)) {
-                            $rawValue = $row['_value'];
-                        } elseif (array_key_exists('value', $row)) {
-                            $rawValue = $row['value'];
-                        } elseif (array_key_exists('Value', $row)) {
-                            $rawValue = $row['Value'];
-                        }
-
-                        // tempo: _time (Flux) ou time
-                        $rawTime = $row['_time'] ?? ($row['time'] ?? null);
-                    }
-
-                    // normaliza valor
-                    if ($rawValue === null || $rawValue === '') {
-                        // para energia, mantemos null quando não há leitura; para sensores, devolvemos 0.0
-                        $normalizedValue = $measurementInfo['measurement'] === 'energy' ? null : 0.0;
-                    } else {
-                        $raw = str_replace(',', '.', trim((string)$rawValue));
-                        $normalizedValue = is_numeric($raw) ? (float)round((float)$raw, $measurementInfo['measurement'] === 'energy' ? 3 : 2) : ($measurementInfo['measurement'] === 'energy' ? null : 0.0);
-                    }
-
-                    // normaliza tempo para timezone da app (string legível) — fallback para raw
-                    $normalizedTime = null;
-                    if ($rawTime) {
-                        try {
-                            $dt = Carbon::parse($rawTime);
-                            $dt->setTimezone(config('app.timezone', 'America/Sao_Paulo'));
-                            $normalizedTime = $dt->toDateTimeString(); // "YYYY-MM-DD HH:MM:SS"
-                        } catch (\Exception $ex) {
-                            Log::debug("Não foi possível parsear rawTime do Influx", ['device' => $device->id, 'rawTime' => $rawTime, 'err' => $ex->getMessage()]);
-                            $normalizedTime = (string)$rawTime;
-                        }
-                    }
-
-                    return [
-                        'value' => $normalizedValue,
-                        'unit'  => $measurementInfo['unit'] ?? null,
-                        'time'  => $normalizedTime
-                    ];
-                } catch (\Exception $e) {
-                    Log::error("Erro ao consultar dados em tempo real para device {$device->id}: " . $e->getMessage());
-                    return [
-                        'value' => $measurementInfo['measurement'] === 'energy' ? null : 0.0,
-                        'unit' => $measurementInfo['unit'] ?? null,
-                        'time' => null
-                    ];
+            if (is_array($row)) {
+                if (array_key_exists('_value', $row)) {
+                    $rawValue = $row['_value'];
+                } elseif (array_key_exists('value', $row)) {
+                    $rawValue = $row['value'];
+                } elseif (array_key_exists('Value', $row)) {
+                    $rawValue = $row['Value'];
                 }
-            });
-        }
 
-        return $influxData;
+                $rawTime = $row['_time'] ?? ($row['time'] ?? null);
+            }
+
+            if ($rawValue === null || $rawValue === '') {
+                $normalizedValue = $measurementInfo['measurement'] === 'energy' ? null : 0.0;
+            } else {
+                $raw = str_replace(',', '.', trim((string)$rawValue));
+                $normalizedValue = is_numeric($raw) ? (float)round((float)$raw, $measurementInfo['measurement'] === 'energy' ? 3 : 2) : ($measurementInfo['measurement'] === 'energy' ? null : 0.0);
+            }
+
+            $normalizedTime = null;
+            if ($rawTime) {
+                try {
+                    $dt = Carbon::parse($rawTime);
+                    $dt->setTimezone(config('app.timezone', 'America/Sao_Paulo'));
+                    $normalizedTime = $dt->toDateTimeString();
+                } catch (\Exception $ex) {
+                    Log::debug("Não foi possível parsear rawTime do Influx", ['device' => $device->id, 'rawTime' => $rawTime, 'err' => $ex->getMessage()]);
+                    $normalizedTime = (string)$rawTime;
+                }
+            }
+
+            return [
+                'value' => $normalizedValue,
+                'unit'  => $measurementInfo['unit'] ?? null,
+                'time'  => $normalizedTime
+            ];
+        } catch (\Exception $e) {
+            Log::error("Erro ao consultar dados em tempo real para device {$device->id}: " . $e->getMessage());
+            return [
+                'value' => $measurementInfo['measurement'] === 'energy' ? null : 0.0,
+                'unit' => $measurementInfo['unit'] ?? null,
+                'time' => null
+            ];
+        }
     }
 
     private function getCachedDailyConsumption(InfluxDBService $influxService, array $deviceIds): array
@@ -173,12 +175,11 @@ FLUX;
             }
 
             $measurementInfo = $this->getMeasurementInfo($device);
-
             $cacheKey = "device_daily_consumption_{$deviceId}_" . Carbon::now()->format('Y-m-d');
 
             $dailyConsumption[$deviceId] = Cache::remember(
                 $cacheKey,
-                self::CACHE_TTL,
+                self::CACHE_TTL_DAILY_DATA,
                 function () use ($influxService, $device, $measurementInfo) {
                     return $this->getDailyMeasurementData($influxService, $device, $measurementInfo);
                 }
@@ -195,7 +196,7 @@ FLUX;
         $stop = Carbon::now($timezone)->endOfDay()->setTimezone('UTC')->toIso8601String();
         $mac = $device->mac_address;
 
-        // Flux para temperatura e umidade sem agregação, pega os dados brutos
+        // Determina a função de agregação baseada no tipo de medição
         if (in_array($measurementInfo['measurement'], ['temperature', 'humidity'])) {
             $query = <<<FLUX
 from(bucket: "{$influxService->getBucket()}")
@@ -203,6 +204,7 @@ from(bucket: "{$influxService->getBucket()}")
   |> filter(fn: (r) => r._measurement == "{$measurementInfo['measurement']}")
   |> filter(fn: (r) => r.mac == "$mac")
   |> filter(fn: (r) => r._field == "{$measurementInfo['field']}")
+  |> aggregateWindow(every: 1d, fn: mean, createEmpty: false)
   |> yield()
 FLUX;
         } else {
@@ -212,29 +214,26 @@ from(bucket: "{$influxService->getBucket()}")
   |> filter(fn: (r) => r._measurement == "{$measurementInfo['measurement']}")
   |> filter(fn: (r) => r.mac == "$mac")
   |> filter(fn: (r) => r._field == "{$measurementInfo['field']}")
+  |> aggregateWindow(every: 1d, fn: sum, createEmpty: false)
   |> yield()
 FLUX;
         }
 
         try {
             $results = $influxService->queryEnergyData($query);
-
             $valuesPerDay = [];
 
             foreach ($results as $row) {
                 if (isset($row['value']) && $row['value'] !== null && $row['value'] !== '') {
                     $localDate = Carbon::parse($row['time'])->setTimezone($timezone)->format('Y-m-d');
                     $value = floatval($row['value']);
-
+                    
+                    // Para sensores, usa o valor médio já calculado
                     if (in_array($measurementInfo['measurement'], ['temperature', 'humidity'])) {
-                        // Último valor do dia sobrescreve o anterior
                         $valuesPerDay[$localDate] = $value;
                     } else {
-                        if (isset($valuesPerDay[$localDate])) {
-                            $valuesPerDay[$localDate] += $value;
-                        } else {
-                            $valuesPerDay[$localDate] = $value;
-                        }
+                        // Para energia, usa soma já calculada
+                        $valuesPerDay[$localDate] = $value;
                     }
                 }
             }
@@ -260,35 +259,46 @@ FLUX;
 
     private function getLast7Days(): array
     {
-        $timezone = config('app.timezone', 'America/Sao_Paulo');
-        $now = Carbon::now($timezone);
-        $days = [];
+        $cacheKey = 'last_7_days_' . Carbon::now()->format('Y-m-d');
+        
+        return Cache::remember($cacheKey, 86400, function () {
+            $timezone = config('app.timezone', 'America/Sao_Paulo');
+            $now = Carbon::now($timezone);
+            $days = [];
 
-        // Começa de 6 dias atrás até hoje (7 dias no total)
-        for ($i = 6; $i >= 0; $i--) {
-            $days[] = $now->copy()->subDays($i)->format('Y-m-d');
+            for ($i = 6; $i >= 0; $i--) {
+                $days[] = $now->copy()->subDays($i)->format('Y-m-d');
+            }
+
+            return $days;
+        });
+    }
+
+    private function getFallbackData(): array
+    {
+        $last7Days = $this->getLast7Days();
+        $fallbackData = [];
+
+        foreach ($last7Days as $date) {
+            $fallbackData[] = ['date' => $date, 'value' => 0];
         }
 
-        return $days;
+        return $fallbackData;
     }
 
     public function create()
     {
         $userId = auth()->id();
+        $cacheKey = "form_data_{$userId}";
 
-        $environments = Environment::where('user_id', $userId)->select(['id', 'name'])->get();
-
-        // Cache para dados de formulário
-        $formData = Cache::remember("form_data_{$userId}", 1800, function () {
+        $formData = Cache::remember($cacheKey, self::CACHE_TTL_FORM_DATA, function () use ($userId) {
             return [
+                'environments' => Environment::where('user_id', $userId)->select(['id', 'name'])->get(),
                 'deviceTypes' => DeviceType::select(['id', 'name'])->get()
             ];
         });
 
-        return view('devices.create', [
-            'environments' => $environments,
-            'deviceTypes' => $formData['deviceTypes'],
-        ]);
+        return view('devices.create', $formData);
     }
 
     public function store(Request $request)
@@ -315,18 +325,18 @@ FLUX;
             Device::create($validated);
         });
 
-        // Limpa cache relacionado
         $this->clearUserCache(auth()->id());
 
         return redirect()->route('devices.index')
             ->with('success', 'Dispositivo cadastrado com sucesso!');
     }
 
-
     public function edit(Device $device)
     {
         $userId = auth()->id();
-        $formData = Cache::remember("form_data_{$userId}", 1800, function () use ($userId) {
+        $cacheKey = "form_data_{$userId}";
+
+        $formData = Cache::remember($cacheKey, self::CACHE_TTL_FORM_DATA, function () use ($userId) {
             return [
                 'environments' => Environment::where('user_id', $userId)
                     ->select(['id', 'name'])
@@ -340,7 +350,6 @@ FLUX;
 
     public function update(Request $request, Device $device)
     {
-
         $validated = $request->validate([
             'name' => 'required|string|max:255',
             'mac_address' => 'required|string|size:17|unique:devices,mac_address,' . $device->id,
@@ -361,7 +370,6 @@ FLUX;
             $device->update($validated);
         });
 
-        // Limpa cache específico do dispositivo e do usuário
         $this->clearDeviceCache($device->id);
         $this->clearUserCache($device->user_id);
 
@@ -397,19 +405,35 @@ FLUX;
      */
     private function clearUserCache(int $userId): void
     {
-        Cache::forget("user_devices_data_{$userId}");
-        Cache::forget("form_data_{$userId}");
+        $patterns = [
+            "user_devices_data_{$userId}_*",
+            "form_data_{$userId}",
+            "device_measurement_*",
+            "device_daily_consumption_*",
+            "device_diagnostics_*"
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (str_contains($pattern, '*')) {
+                // Limpar todos os caches que correspondem ao padrão
+                // Esta implementação pode variar dependendo do driver de cache
+                // Aqui é um exemplo genérico
+                Cache::flush();
+            } else {
+                Cache::forget($pattern);
+            }
+        }
     }
 
     private function clearDeviceCache(int $deviceId): void
     {
-        // Cache de medição em tempo real (chave correta usada em getCachedInfluxData)
+        // Limpa cache de medição em tempo real
         Cache::forget("device_measurement_{$deviceId}");
 
-        // Cache de consumo histórico
+        // Limpa cache de consumo histórico
         Cache::forget("device_consumption_{$deviceId}");
 
-        // Cache de diagnósticos
+        // Limpa cache de diagnósticos
         Cache::forget("device_diagnostics_{$deviceId}");
 
         // Limpa cache de consumo diário (últimos 10 dias + próximos 3 dias)
@@ -418,66 +442,31 @@ FLUX;
             Cache::forget("device_daily_consumption_{$deviceId}_{$date}");
         }
     }
-    public function clearCacheAndDebug(Device $device, InfluxDBService $influxService)
-    {
-        // Limpar todo o cache relacionado
-        $this->clearDeviceCache($device->id);
-        $this->clearUserCache($device->user_id);
 
-        // Fazer query direta para verificar dados
-        $measurementInfo = $this->getMeasurementInfo($device);
-        $mac = $device->mac_address;
-
-        $debugQuery = <<<FLUX
-        from(bucket: "{$influxService->getBucket()}")
-        |> range(start: -7d)
-        |> filter(fn: (r) => r._measurement == "{$measurementInfo['measurement']}")
-        |> filter(fn: (r) => r.mac == "{$mac}")
-        |> filter(fn: (r) => r._field == "{$measurementInfo['field']}")
-        |> limit(n: 20)
-        FLUX;
-
-        try {
-            $rawData = $influxService->queryEnergyData($debugQuery);
-
-            Log::info("DEBUG - Raw data for device {$device->id}:", [
-                'measurement_info' => $measurementInfo,
-                'mac_address' => $mac,
-                'raw_data_count' => count($rawData),
-                'sample_data' => array_slice($rawData, 0, 5)
-            ]);
-
-            return [
-                'device_id' => $device->id,
-                'measurement_info' => $measurementInfo,
-                'raw_data_count' => count($rawData),
-                'sample_data' => array_slice($rawData, 0, 10)
-            ];
-        } catch (\Exception $e) {
-            Log::error("Erro no debug do device {$device->id}: " . $e->getMessage());
-            return ['error' => $e->getMessage()];
-        }
-    }
     private function getMeasurementInfo(Device $device): array
     {
-        $typeName = strtolower($device->deviceType->name ?? '');
+        $cacheKey = "measurement_info_{$device->id}";
+        
+        return Cache::remember($cacheKey, 3600, function () use ($device) {
+            $typeName = strtolower($device->deviceType->name ?? '');
 
-        return match (true) {
-            str_contains($typeName, 'temperature sensor') => [
-                'measurement' => 'temperature',
-                'field' => 'temperature',
-                'unit' => '°C'
-            ],
-            str_contains($typeName, 'humidity sensor') => [
-                'measurement' => 'humidity',
-                'field' => 'humidity',
-                'unit' => '%'
-            ],
-            default => [
-                'measurement' => 'energy',
-                'field' => 'consumption_kwh',
-                'unit' => 'kWh'
-            ]
-        };
+            return match (true) {
+                str_contains($typeName, 'temperature sensor') => [
+                    'measurement' => 'temperature',
+                    'field' => 'temperature',
+                    'unit' => '°C'
+                ],
+                str_contains($typeName, 'humidity sensor') => [
+                    'measurement' => 'humidity',
+                    'field' => 'humidity',
+                    'unit' => '%'
+                ],
+                default => [
+                    'measurement' => 'energy',
+                    'field' => 'consumption_kwh',
+                    'unit' => 'kWh'
+                ]
+            };
+        });
     }
 }

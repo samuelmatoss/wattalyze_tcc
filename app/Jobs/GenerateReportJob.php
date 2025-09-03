@@ -40,7 +40,6 @@ class GenerateReportJob implements ShouldQueue
         $cost = 0;
         $remaining = $consumption;
 
-        // Definir faixas de consumo
         $brackets = [
             [
                 'limit' => $tariff->bracket1_max ?? INF,
@@ -59,17 +58,14 @@ class GenerateReportJob implements ShouldQueue
         foreach ($brackets as $index => $bracket) {
             if ($remaining <= 0) break;
 
-            // Calcular o limite da faixa atual
             $prevLimit = $index > 0 ? $brackets[$index - 1]['limit'] : 0;
             $currentLimit = min($bracket['limit'], $prevLimit + ($bracket['limit'] ?? INF)) - $prevLimit;
 
-            // Calcular consumo na faixa atual
             $bracketConsumption = min($remaining, $currentLimit);
             $cost += $bracketConsumption * $bracket['rate'];
             $remaining -= $bracketConsumption;
         }
 
-        // Aplicar taxa adicional se existir
         if (!empty($tariff->tax_rate)) {
             $cost += $cost * ($tariff->tax_rate / 100);
         }
@@ -103,6 +99,16 @@ class GenerateReportJob implements ShouldQueue
         $dailyData = [];
         $dailyCosts = [];
         $charts = [];
+        $summaryData = [];
+
+        // Gerar período completo de datas
+        $periodStart = Carbon::parse($report->period_start);
+        $periodEnd = Carbon::parse($report->period_end);
+        $datesInPeriod = [];
+
+        for ($date = $periodStart->copy(); $date->lte($periodEnd); $date->addDay()) {
+            $datesInPeriod[] = $date->format('Y-m-d');
+        }
 
         foreach ($devices as $device) {
             $query = <<<FLUX
@@ -117,53 +123,71 @@ FLUX;
                 $result = $influx->queryEnergyData($query);
 
                 // Inicializa arrays para o dispositivo
-                $dailyData[$device->name] = [];
-                $dailyCosts[$device->name] = [];
+                $dailyData[$device->name] = array_fill_keys($datesInPeriod, 0);
+                $dailyCosts[$device->name] = array_fill_keys($datesInPeriod, 0);
 
                 foreach ($result as $row) {
                     $localDate = Carbon::parse($row['time'])->setTimezone($timezone)->format('Y-m-d');
                     $consumption = round($row['value'] ?? 0, 4);
 
-                    // Soma o consumo diário
-                    if (!isset($dailyData[$device->name][$localDate])) {
-                        $dailyData[$device->name][$localDate] = 0;
+                    if (isset($dailyData[$device->name][$localDate])) {
+                        $dailyData[$device->name][$localDate] += $consumption;
                     }
-                    $dailyData[$device->name][$localDate] += $consumption;
                 }
 
-                // Calcula custo com base no consumo diário somado
+                // Calcula custos e dados de resumo
+                $totalConsumption = 0;
+                $totalCost = 0;
+                $maxConsumption = 0;
+                $minConsumption = PHP_FLOAT_MAX;
+
                 foreach ($dailyData[$device->name] as $date => $consumptionSum) {
-                    $dailyCosts[$device->name][$date] = $this->calculateCost($consumptionSum, $tariff);
-                }
-
-                // Preencher dias faltantes no período com zero
-                $periodStart = Carbon::parse($report->period_start);
-                $periodEnd = Carbon::parse($report->period_end);
-                $datesInPeriod = [];
-
-                for ($date = $periodStart->copy(); $date->lte($periodEnd); $date->addDay()) {
-                    $dateStr = $date->format('Y-m-d');
-                    $datesInPeriod[] = $dateStr;
-
-                    if (!isset($dailyData[$device->name][$dateStr])) {
-                        $dailyData[$device->name][$dateStr] = 0;
-                        $dailyCosts[$device->name][$dateStr] = 0;
+                    $cost = $this->calculateCost($consumptionSum, $tariff);
+                    $dailyCosts[$device->name][$date] = $cost;
+                    
+                    $totalConsumption += $consumptionSum;
+                    $totalCost += $cost;
+                    
+                    if ($consumptionSum > 0) {
+                        $maxConsumption = max($maxConsumption, $consumptionSum);
+                        $minConsumption = min($minConsumption, $consumptionSum);
                     }
                 }
 
-                // Ordenar por data
-                ksort($dailyData[$device->name]);
-                ksort($dailyCosts[$device->name]);
+                $summaryData[$device->name] = [
+                    'total_consumption' => round($totalConsumption, 2),
+                    'total_cost' => round($totalCost, 2),
+                    'avg_consumption' => round($totalConsumption / count($datesInPeriod), 2),
+                    'avg_cost' => round($totalCost / count($datesInPeriod), 2),
+                    'max_consumption' => round($maxConsumption, 2),
+                    'min_consumption' => $minConsumption === PHP_FLOAT_MAX ? 0 : round($minConsumption, 2),
+                ];
 
-                // Gerar gráficos
-                $labels = $datesInPeriod;
+                // Gerar gráficos melhorados
+                $labels = array_map(function($date) {
+                    return Carbon::parse($date)->format('d/m');
+                }, $datesInPeriod);
+
                 $consumptionValues = array_values($dailyData[$device->name]);
                 $costValues = array_values($dailyCosts[$device->name]);
 
                 $charts[$device->name] = [
-                    'consumption_chart_base64' => $this->generateChartBase64($labels, $consumptionValues, 'Energia Gasta (kWh)', '#27ae60'),
-                    'cost_chart_base64' => $this->generateChartBase64($labels, $costValues, 'Custo (R$)', '#e74c3c'),
+                    'consumption_chart_base64' => $this->generateAdvancedChartBase64(
+                        $labels, 
+                        $consumptionValues, 
+                        'Consumo de Energia (kWh)', 
+                        '#2E8B57',
+                        'line'
+                    ),
+                    'cost_chart_base64' => $this->generateAdvancedChartBase64(
+                        $labels, 
+                        $costValues, 
+                        'Custo Energético (R$)', 
+                        '#DC143C',
+                        'bar'
+                    ),
                 ];
+
             } catch (\Exception $e) {
                 Log::error("Erro ao processar dispositivo {$device->id}: " . $e->getMessage());
                 continue;
@@ -176,14 +200,17 @@ FLUX;
             'period_end' => Carbon::parse($report->period_end)->format('d/m/Y'),
             'devices' => $dailyData,
             'costs' => $dailyCosts,
-            'charts' => $charts
+            'charts' => $charts,
+            'summary' => $summaryData,
+            'total_devices' => count($devices),
+            'generated_at' => now()->format('d/m/Y H:i')
         ];
 
         $html = view('reports.templates.default', [
             'reportData' => $reportData,
         ])->render();
 
-        $pdf = Pdf::loadHTML($html);
+        $pdf = Pdf::loadHTML($html)->setPaper('a4', 'portrait');
         $fileName = "reports/{$report->id}_" . now()->format('YmdHis') . ".pdf";
         Storage::put($fileName, $pdf->output());
 
@@ -201,7 +228,132 @@ FLUX;
             (new ThrottlesExceptions(5, 1))->backoff(30),
         ];
     }
-    private function generateChartUrl(array $labels, array $data, string $label, string $color = 'blue'): string
+
+    /**
+     * Gera gráfico avançado com melhor design
+     */
+    private function generateAdvancedChartBase64(array $labels, array $data, string $label, string $color = '#2E8B57', string $type = 'line'): string
+    {
+        // Cores gradiente para melhor visual
+        $gradientColors = [
+            '#2E8B57' => ['#2E8B57', '#32CD32'],  // Verde
+            '#DC143C' => ['#DC143C', '#FF6347'],  // Vermelho
+        ];
+
+        $gradient = $gradientColors[$color] ?? [$color, $color];
+
+        $chartConfig = [
+            'type' => $type,
+            'data' => [
+                'labels' => $labels,
+                'datasets' => [[
+                    'label' => $label,
+                    'data' => $data,
+                    'backgroundColor' => $type === 'bar' ? $gradient[0] . '80' : $gradient[0] . '20',
+                    'borderColor' => $gradient[0],
+                    'borderWidth' => 3,
+                    'fill' => $type === 'line' ? 'start' : false,
+                    'tension' => 0.4,
+                    'pointBackgroundColor' => $gradient[0],
+                    'pointBorderColor' => '#ffffff',
+                    'pointBorderWidth' => 2,
+                    'pointRadius' => 5,
+                    'pointHoverRadius' => 7,
+                ]]
+            ],
+            'options' => [
+                'responsive' => true,
+                'maintainAspectRatio' => false,
+                'layout' => [
+                    'padding' => [
+                        'top' => 20,
+                        'bottom' => 20,
+                        'left' => 20,
+                        'right' => 20
+                    ]
+                ],
+                'scales' => [
+                    'yAxes' => [[
+                        'ticks' => [
+                            'beginAtZero' => true,
+                            'fontColor' => '#666666',
+                            'fontSize' => 12,
+                            'fontStyle' => 'bold',
+                            'callback' => '%%CALLBACK%%'
+                        ],
+                        'gridLines' => [
+                            'color' => '#E5E5E5',
+                            'lineWidth' => 1,
+                            'drawBorder' => false
+                        ]
+                    ]],
+                    'xAxes' => [[
+                        'ticks' => [
+                            'fontColor' => '#666666',
+                            'fontSize' => 11,
+                            'fontStyle' => 'bold'
+                        ],
+                        'gridLines' => [
+                            'display' => false
+                        ]
+                    ]]
+                ],
+                'legend' => [
+                    'display' => true,
+                    'position' => 'top',
+                    'labels' => [
+                        'fontColor' => '#333333',
+                        'fontSize' => 14,
+                        'fontStyle' => 'bold',
+                        'usePointStyle' => true,
+                        'padding' => 20
+                    ]
+                ],
+                'plugins' => [
+                    'datalabels' => [
+                        'display' => false
+                    ]
+                ]
+            ]
+        ];
+
+        // Adicionar formatação personalizada para os valores do eixo Y
+        if (strpos($label, 'R$') !== false) {
+            $chartConfig['options']['scales']['yAxes'][0]['ticks']['callback'] = 'function(value) { return "R$ " + value.toFixed(2); }';
+        } else {
+            $chartConfig['options']['scales']['yAxes'][0]['ticks']['callback'] = 'function(value) { return value.toFixed(2) + " kWh"; }';
+        }
+
+        $encodedConfig = urlencode(json_encode($chartConfig));
+        $url = "https://quickchart.io/chart?c={$encodedConfig}&format=png&backgroundColor=white&width=800&height=400&devicePixelRatio=2";
+
+        try {
+            $context = stream_context_create([
+                'http' => [
+                    'timeout' => 30,
+                    'method' => 'GET'
+                ]
+            ]);
+            
+            $imageContents = file_get_contents($url, false, $context);
+            
+            if ($imageContents === false) {
+                throw new \Exception('Falha ao gerar gráfico');
+            }
+
+            $base64 = base64_encode($imageContents);
+            return "data:image/png;base64,{$base64}";
+            
+        } catch (\Exception $e) {
+            Log::error("Erro ao gerar gráfico: " . $e->getMessage());
+            return $this->generateFallbackChart($labels, $data, $label, $color);
+        }
+    }
+
+    /**
+     * Gera um gráfico simples como fallback
+     */
+    private function generateFallbackChart(array $labels, array $data, string $label, string $color): string
     {
         $chartConfig = [
             'type' => 'line',
@@ -209,61 +361,24 @@ FLUX;
                 'labels' => $labels,
                 'datasets' => [[
                     'label' => $label,
-                    'backgroundColor' => $color,
-                    'borderColor' => $color,
-                    'fill' => false,
                     'data' => $data,
+                    'borderColor' => $color,
+                    'backgroundColor' => $color . '40',
+                    'fill' => true
                 ]]
             ],
             'options' => [
                 'scales' => [
-                    'yAxes' => [[
-                        'ticks' => [
-                            'beginAtZero' => true,
-                        ],
-                    ]],
-                ],
-            ],
-        ];
-
-        $encodedConfig = urlencode(json_encode($chartConfig));
-        return "https://quickchart.io/chart?c={$encodedConfig}";
-    }
-    private function generateChartBase64(array $labels, array $data, string $label, string $color = 'blue'): string
-    {
-        $chartConfig = [
-            'type' => 'line',
-            'data' => [
-                'labels' => $labels,
-                'datasets' => [[
-                    'label' => $label,
-                    'backgroundColor' => $color,
-                    'borderColor' => $color,
-                    'fill' => false,
-                    'data' => $data,
-                ]],
-            ],
-            'options' => [
-                'scales' => [
-                    'yAxes' => [[
-                        'ticks' => [
-                            'beginAtZero' => true,
-                        ],
-                    ]],
-                ],
-            ],
+                    'yAxes' => [['ticks' => ['beginAtZero' => true]]]
+                ]
+            ]
         ];
 
         $encodedConfig = urlencode(json_encode($chartConfig));
         $url = "https://quickchart.io/chart?c={$encodedConfig}&format=png&backgroundColor=white&width=600&height=300";
-
-        // Pega o conteúdo da imagem via HTTP
+        
         $imageContents = file_get_contents($url);
-
-        // Transforma para base64
         $base64 = base64_encode($imageContents);
-
-        // Retorna no formato aceito pelo <img>
         return "data:image/png;base64,{$base64}";
     }
 }

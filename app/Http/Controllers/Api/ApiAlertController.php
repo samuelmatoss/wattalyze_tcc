@@ -10,7 +10,7 @@ use App\Models\Environment;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 
-class AlertController extends Controller
+class ApiAlertController extends Controller
 {
     /**
      * Get all alert rules for authenticated user

@@ -2,8 +2,6 @@
 
 namespace App\Http\Controllers\Api;
 
-namespace App\Http\Controllers\Api;
-
 use App\Http\Controllers\Controller;
 use App\Models\Device;
 use App\Models\Environment;
@@ -17,7 +15,7 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Validator;
 
-class DeviceController extends Controller
+class ApiDeviceController extends Controller
 {
     private const CACHE_TTL = 300; // 5 minutos
     private const POWER_CACHE_TTL = 60; // 1 minuto para dados de potência

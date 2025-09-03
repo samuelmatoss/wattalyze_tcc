@@ -13,7 +13,7 @@ use Illuminate\Support\Facades\Validator;
 use Illuminate\Auth\Events\Registered;
 use Illuminate\Auth\Events\PasswordResetLinkRequested;
 
-class AuthController extends Controller
+class ApiAuthController extends Controller
 {
     /**
      * Register a new user

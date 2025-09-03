@@ -11,7 +11,7 @@ use Carbon\Carbon;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Http\JsonResponse;
 
-class HomeController extends Controller
+class ApiHomeController extends Controller
 {
     /**
      * Get dashboard data for authenticated user

@@ -8,7 +8,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
 use App\Jobs\GenerateReportJob;
 
-class ReportController extends Controller
+class ApiReportController extends Controller
 {
     public function generate(Request $request)
     {

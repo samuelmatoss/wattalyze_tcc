@@ -13,7 +13,7 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Validator;
 
-class EnvironmentController extends Controller
+class ApiEnvironmentController extends Controller
 {
      private const CACHE_TTL = 300; // 5 minutos
 

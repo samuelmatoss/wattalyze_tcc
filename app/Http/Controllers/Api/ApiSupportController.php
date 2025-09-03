@@ -8,7 +8,7 @@ use App\Mail\SupportMessage;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Validator;
-class SupportController extends Controller
+class ApiSupportController extends Controller
 {
     /**
      * Submit a support request

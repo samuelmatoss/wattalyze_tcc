@@ -9,7 +9,7 @@ use Illuminate\Support\Facades\Auth;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Validator;
 
-class EnergyTariffController extends Controller
+class ApiEnergyTariffController extends Controller
 {
     /**
      * Get all energy tariffs for authenticated user
