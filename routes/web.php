@@ -27,7 +27,7 @@ use App\Http\Controllers\Web\EnergyTariffController;
 
 Route::get('/', function () {
     return view('welcome');
-});
+})->name('welcome');
 // routes/web.php
 Route::get('/devices/{device}/influx-data', [DeviceController::class, 'influxData'])
     ->name('devices.influxData');
