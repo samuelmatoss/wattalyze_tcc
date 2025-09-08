@@ -214,7 +214,8 @@
                 </div>
             </div>
 
-            <form class="space-y-6">
+            <form method="POST" action="{{ route('register') }}" class="space-y-6">
+                @csrf
                 <!-- Nome -->
                 <div class="group">
                     <label for="name" class="block text-sm font-semibold text-gray-700 mb-2">

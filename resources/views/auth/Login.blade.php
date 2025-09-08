@@ -249,8 +249,9 @@
             </div>
         </div>
 
-        <!-- Formulário Principal -->
-        <div class="glass-card rounded-2xl p-8">
+       <form method="POST" action="{{ route('login') }}" class="space-y-6 glass-card rounded-2xl p-8">
+        @csrf
+        
             <form class="space-y-6" id="login-form">
                 <!-- Email -->
                 <div class="group">
@@ -334,10 +335,10 @@
                     </a>
                 </div>
             </form>
-        </div>
+ 
 
 
-
+        </form> 
         <!-- Footer -->
         <div class="text-center text-sm text-white/70">
             <p>&copy; 2025 Wattalyze. Todos os direitos reservados.</p>
@@ -345,23 +346,7 @@
     </div>
 
     <script>
-        // Preencher credenciais demo
-        function fillDemoCredentials() {
-            document.getElementById('email').value = 'demo@wattalyze.com';
-            document.getElementById('password').value = '123456';
-            
-            // Animação visual
-            const inputs = [document.getElementById('email'), document.getElementById('password')];
-            inputs.forEach((input, index) => {
-                setTimeout(() => {
-                    input.style.transform = 'scale(1.02)';
-                    input.style.borderColor = '#27ae60';
-                    setTimeout(() => {
-                        input.style.transform = 'scale(1)';
-                    }, 200);
-                }, index * 100);
-            });
-        }
+
 
         // Simulação de login (para demonstração)
         document.getElementById('login-form').addEventListener('submit', function(e) {

@@ -18,7 +18,7 @@
         @import url('https://fonts.googleapis.com/css2?family=SUSE:wght@300&display=swap');
 
         body {
-            font-family: "SUSE", sans-serif;
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             background-color: #ecf0f1;
         }
 
@@ -117,7 +117,7 @@
                 <!-- Notificações -->
                 <div class="dropdown me-2">
                     <a class="nav-link position-relative" href="#" id="alertsDropdown" role="button" data-bs-toggle="dropdown" aria-expanded="false">
-                        <i class="bi bi-bell-fill" style="font-size: 1rem;"></i>
+                        <i class="bi bi-bell-fill" ></i>
 
                         @if($alerts->count() > 0)
                         <span class="position-absolute top-0 start-100 translate-middle badge rounded-pill bg-danger">
